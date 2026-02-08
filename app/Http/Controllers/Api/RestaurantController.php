@@ -6,6 +6,9 @@ use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
 use App\Traits\ApiResponse;
 use Illuminate\Http\Request;
+
+use App\Services\CloudinaryService;
+
 use App\Models\Restaurant;
 use App\Models\RestaurantDocument;
 use App\Models\RestaurantImages;
@@ -16,6 +19,12 @@ use Illuminate\Support\Facades\Storage;
 class RestaurantController extends Controller
 {
     use ApiResponse;
+    protected $cloudinary;
+
+    public function __construct(CloudinaryService $cloudinary)
+    {
+        $this->cloudinary = $cloudinary;
+    }
 
     public function index(Request $request)
     {
@@ -80,29 +89,39 @@ class RestaurantController extends Controller
 
         $user = $request->user();
 
-        $hasPending = Restaurant::where('user_uid', $user->uid)
-            ->where('status', 'pending')
-            ->exists();
+        try {
+            $hasPending = Restaurant::where('user_uid', $user->uid)
+                ->where('status', 'pending')
+                ->exists();
 
-        if ($hasPending) {
+            if ($hasPending) {
+                return $this->errorResponse(
+                    403,
+                    'You already have a restaurant with pending status. Please wait for approval before creating a new one.'
+                );
+            }
+
+            $data = $validator->validated();
+            $data['user_uid'] = $user->uid;
+
+            $restaurants = Restaurant::create($data);
+
+            return $this->successResponse(
+                201,
+                'Restaurant created successfully',
+                [
+                    'addresses' => $restaurants
+                ]
+            );
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            return $this->errorResponse(404, 'Restaurant not found');
+        } catch (\Throwable $e) {
             return $this->errorResponse(
-                403,
-                'You already have a restaurant with pending status. Please wait for approval before creating a new one.'
+                500,
+                'Something went wrong while create restaurant',
+                $e->getMessage()
             );
         }
-
-        $data = $validator->validated();
-        $data['user_uid'] = $user->uid;
-
-        $restaurants = Restaurant::create($data);
-
-        return $this->successResponse(
-            201,
-            'Restaurant created successfully',
-            [
-                'addresses' => $restaurants
-            ]
-        );
     }
 
     public function getRestaurants(Request $request)
@@ -209,68 +228,51 @@ class RestaurantController extends Controller
 
     public function addRestaurantImages(Request $request, string $uid)
     {
-        // Validate request
         $validator = Validator::make($request->all(), [
-            'file' => 'required|file|mimes:pdf,jpg,jpeg,png|max:5120', // 5MB limit
+            'file' => 'required|file|mimes:jpg,jpeg,png|max:5120',
             'for'  => 'required|string|in:banner,front_image,logo,inside_image',
         ]);
 
         if ($validator->fails()) {
-            return $this->errorResponse(
-                422,
-                'Validation failed',
-                $validator->errors()
-            );
+            return $this->errorResponse(422, 'Validation failed', $validator->errors());
         }
 
-        // Find restaurant
-        $restaurant = Restaurant::where('uid', $uid)->first();
-        if (!$restaurant) {
-            return $this->errorResponse(
-                404,
-                'Restaurant not found',
-                []
+        try {
+            $restaurant = Restaurant::where('uid', $uid)->firstOrFail();
+
+            $imageUrl = $this->cloudinary->uploadImage(
+                $request->file('file'),
+                'restaurants/images'
             );
-        }
 
-        $file = $request->file('file');
-        $for  = $request->input('for');
-
-        $existingImage = RestaurantImages::where('restaurant_uid', $restaurant->uid)
-            ->where('type', $for)
-            ->first();
-
-        // Store file
-        $filePath = $file->store('restaurants/images', 'public');
-
-        if ($existingImage) {
-            // Delete old file from storage if it exists
-            if (Storage::disk('public')->exists($existingImage->file_path)) {
-                Storage::disk('public')->delete($existingImage->file_path);
+            if (!$imageUrl) {
+                throw new \Exception('Cloudinary upload failed');
             }
 
-            // Update existing record
-            $existingImage->update([
-                'file_path' => $filePath,
-            ]);
+            $image = RestaurantImages::updateOrCreate(
+                [
+                    'restaurant_uid' => $restaurant->uid,
+                    'type'           => $request->for,
+                ],
+                [
+                    'file_path' => $imageUrl, // Cloudinary URL
+                ]
+            );
 
-            $image = $existingImage;
-            $message  = 'Image updated successfully';
-        } else {
-            // Create new record
-            $image = RestaurantImages::create([
-                'restaurant_uid' => $restaurant->uid,
-                'type'           => $for,
-                'file_path'      => $filePath,
-            ]);
-            $message = 'Image uploaded successfully';
+            return $this->successResponse(
+                200,
+                'Image uploaded successfully',
+                ['image' => $image]
+            );
+        } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+            return $this->errorResponse(404, 'Restaurant not found');
+        } catch (\Throwable $e) {
+            return $this->errorResponse(
+                500,
+                'Something went wrong while uploading image',
+                $e->getMessage()
+            );
         }
-
-        return $this->successResponse(
-            200,
-            $message,
-            ['image' => $image]
-        );
     }
 
     public function createMenu(Request $request, string $restaurantId)
